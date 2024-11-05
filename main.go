@@ -1,65 +1,27 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	c "goBroadcaster/constants"
+	l "goBroadcaster/listnermanager"
 	"log"
 	"sync"
 	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 )
 
-type ListenerManager struct {
-	listeners []chan string
-	mu        sync.Mutex
-}
-
-func (lm *ListenerManager) AddListener() chan string {
-	time.Sleep(1 * time.Millisecond)
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-	ch := make(chan string)
-	lm.listeners = append(lm.listeners, ch)
-	return ch
-}
-
-func (lm *ListenerManager) Broadcast(msg string) {
-	time.Sleep(1 * time.Millisecond)
-	log.Println("Entered Broadcast")
-	lm.mu.Lock()
-
-	defer func() {
-		fmt.Println("Broadcaster Done")
-	}()
-	defer lm.mu.Unlock()
-	if len(lm.listeners) > 0 {
-		log.Println("Publishing")
-		for _, listener := range lm.listeners {
-			fmt.Println(listener)
-			listener <- msg
-		}
-	} else {
-		fmt.Println("No active listners to publish message")
+func failOnError(err error, msg string) {
+	if err != nil {
+		log.Fatalf("%s: %s", msg, err)
 	}
 }
 
-func (lm *ListenerManager) RemoveListener(ch chan string) {
-	log.Println("Entered to remove")
-	lm.mu.Lock()
-	defer lm.mu.Unlock()
-	defer func() {
-		fmt.Println("Done")
-	}()
+var SendMessageChannel chan []byte
 
-	for i, listener := range lm.listeners {
-		if listener == ch {
-			log.Println(listener, ch, i)
-			lm.listeners = append(lm.listeners[:i], lm.listeners[i+1:]...)
-			close(ch)
-			break
-		}
-	}
-}
-
-func consumer(lm *ListenerManager, timeout int, id int, ch chan string, wg *sync.WaitGroup) {
+func consumer(lm *l.ListenerManager, timeout int, id string, ch chan c.Message, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer lm.RemoveListener(ch)
 
@@ -67,58 +29,143 @@ func consumer(lm *ListenerManager, timeout int, id int, ch chan string, wg *sync
 	for {
 		select {
 		case <-ticker.C:
-			log.Printf("Consumer %d timedout \n", id)
+			log.Printf("Consumer %v timedout \n", id)
 			return
 		case msg := <-ch:
-			log.Printf("Consumer %d received message: %s\n", id, msg)
-			go processMessage(id)
+			if id == msg.Id {
+				log.Printf("Consumer %v received message: %s\n", id, msg)
+				go processMessage(id)
+				return
+			}
 		}
 	}
 }
 
-func processMessage(id int) {
-	time.Sleep(1 * time.Second)
+func processMessage(id string) {
+	time.Sleep(1 * time.Millisecond)
+	log.Printf("%v marked as done", id)
 }
 
 func main() {
 	var wg sync.WaitGroup
+	SendMessageChannel = make(chan []byte)
+	lm := &l.ListenerManager{}
 
-	lm := &ListenerManager{}
+	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
+	failOnError(err, "Failed to connect to RabbitMQ")
+	ch, err := conn.Channel()
+	failOnError(err, "Failed to open a channel")
+	tempQ, err := ch.QueueDeclare(
+		"temp", // name
+		true,   // durable
+		false,  // delete when unused
+		false,  // exclusive
+		false,  // no-wait
+		nil,    // arguments
+	)
+	failOnError(err, "Failed to open a channel")
+
+	recQ, err := ch.QueueDeclare(
+		"krakenResponse", // name
+		true,             // durable
+		false,            // delete when unused
+		false,            // exclusive
+		false,            // no-wait
+		nil,              // arguments
+	)
+	failOnError(err, "Failed to open a channel")
+
+	failOnError(err, "Failed to declare a queue")
+	sendQ, err := ch.QueueDeclare(
+		"SCBJOY80085-krakenAgent", // name
+		true,                      // durable
+		false,                     // delete when unused
+		false,                     // exclusive
+		false,                     // no-wait
+		nil,                       // arguments
+	)
+	failOnError(err, "Failed to declare a queue")
+
+	msgs, err := ch.Consume(
+		tempQ.Name, // queue
+		"",         // consumer
+		true,       // auto-ack
+		false,      // exclusive
+		false,      // no-local
+		false,      // no-wait
+		nil,        // args
+	)
+	failOnError(err, "Failed to open a channel")
+
+	recQmsg, err := ch.Consume(
+		recQ.Name, // queue
+		"",        // consumer
+		true,      // auto-ack
+		false,     // exclusive
+		false,     // no-local
+		false,     // no-wait
+		nil,       // args
+	)
+	failOnError(err, "Failed to open a channel")
+
 	wg.Add(3)
 	go func() {
 		defer wg.Done()
-		for i := 1; i <= 10; i++ {
-			message := fmt.Sprintf("%d", i)
-			log.Printf("Broadcasting: %s\n", message)
-			lm.Broadcast(message)
-			time.Sleep(1 * time.Second)
-		}
-		fmt.Println("broadCaster Done")
-	}()
+		log.Println("Started recQ")
 
-	go func() {
-		defer wg.Done()
-
-		for i := 1; i <= 3; i++ {
-
-			ch := lm.AddListener()
+		for d := range recQmsg {
+			var message c.Message
+			log.Printf("Received a message from agent: %s", d.Body)
+			json.Unmarshal(d.Body, &message)
 			wg.Add(1)
-			go consumer(lm, 4, i, ch, &wg)
-			// time.Sleep(1 * time.Second)
+			lm.Broadcast(message)
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
+		for msg := range SendMessageChannel {
+			log.Println("message")
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
 
-		time.Sleep(1 * time.Second)
-		ch := lm.AddListener()
-		wg.Add(1)
-		go consumer(lm, 4, 4, ch, &wg)
-		log.Println("Consumer 4 added.")
+				err = ch.PublishWithContext(ctx,
+					"",         // exchange
+					sendQ.Name, // routing key
+					false,      // mandatory
+					false,      // immediate
+					amqp.Publishing{
+						ContentType: "text/plain",
+						Body:        msg,
+					})
+				if err != nil {
+					log.Printf("Error: %s", err)
+				}
+				log.Printf("Sent %s\n", string(msg))
+				lis := lm.AddListener()
+				var message c.Message
+				json.Unmarshal(msg, &message)
+				log.Println(message)
+				wg.Add(1)
+				go consumer(lm, 2, message.Id, lis, &wg)
 
+			}()
+		}
+		fmt.Println("bye")
 	}()
+	go func() {
+		defer wg.Done()
+		log.Println("Started tempQ")
+		for d := range msgs {
+			log.Println(d.Body)
+			SendMessageChannel <- d.Body
+			log.Println("message")
 
+		}
+	}()
 	wg.Wait()
-	fmt.Println("All consumers finished.")
+	failOnError(err, "Failed to register a consumer")
 }
